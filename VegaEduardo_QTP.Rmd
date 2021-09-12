@@ -1,0 +1,585 @@
+---
+title: "Algo Trading Assignment"
+author: "Eduardo"
+date: "01/04/2021"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r libraries, echo=FALSE, include=FALSE}
+library(tidyquant)
+library(dplyr)
+library(quantmod)
+library(tidyr)
+library(GGally)
+library(timetk)
+library(TTR)
+library(RTL)
+library(PerformanceAnalytics)
+library(knitr)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+```{=html}
+<style type="text/css"> body, td {font-size: 12px;} code.r{font-size: 10px;} pre {font-size: 10px} </style>
+```
+
+
+My trading strategy starts by the simplest investing principle of buying
+low and selling high. When looking at a stock chart in retrospective it
+is easy to say when to buy and when to sell but the truth is that it is
+impossible to time the market. For that reason, my strategy will
+gradually buy the dips and reluctantly sell during the good times.
+
+### Main idea:
+
+I looked at the distribution of historic returns of the S&P. A day
+negative return of 6% is rather rare, compared to days of -2% or -3%. My
+strategy will be based on buying those 'big' dips as they happen.
+
+And to sell, my algorithm will sell as the big green days come along.
+Then I will include many rules to this base strategy to maximize
+profits. Such as:
+
+-   What are the cumulative returns over the past x days? Do it for
+    various x's. Each x with its column.
+-   What influence does the VIX have?
+
+```{r echo=FALSE}
+ticks <- c('SPY', 'IWM', '^VIX', 'QQQ') 
+
+df <- tq_get(ticks, from = '1900-01-01') %>% 
+  dplyr::rename_all(tools::toTitleCase)
+
+df.wide <- df %>% dplyr::select(Date,Symbol,Adjusted) %>% 
+  pivot_wider(names_from = 'Symbol', values_from = c('Adjusted'))
+```
+
+First lets look at the distributions for the daily, weekly, monthly,
+trimonthly, semiannual and annual returns of the S&P. It is much better
+to buy after a 40% drawdown over a certain time than buying a big but
+insignificant drop in one day.
+
+```{r echo=FALSE}
+xDayReturns <- function(equity, x = c(1,5,10), date_column = NULL) {
+  # x: a vector of days to calculate returns
+  # equity: the column of the equity's prices
+
+  new_df <- tibble(.rows = nrow(equity))
+  for (days in seq(1, length(x))) {
+    col_name = paste0(x[days], "-day")
+    return <- equity %>% sapply(FUN = RETURN, n = x[days])
+    new_df[col_name] <- return %>% sapply(FUN = round, digits=5)
+  }
+  
+  return(new_df)
+  
+}
+
+spy.ret <- df.wide %>% select(Date, SPY) %>% na.omit() %>% 
+  cbind(xDayReturns(equity = na.omit(df.wide['SPY']), x=c(1,5,21, 63, 126, 252, 1260))) #21 business days per month
+
+spy.ret.long <- spy.ret %>% pivot_longer(cols = 3:ncol(spy.ret),
+                                         names_to = 'horizon',
+                                         values_to = 'return') %>% 
+  group_by(horizon) %>% 
+  na.omit()
+
+stats.ret <- spy.ret.long %>% summarise('mean' = mean(return),
+                                        'sd' = sd(return),
+                                        'kurtosis' = kurtosis(return),
+                                        'minimum'=min(return),
+                                        'maximum'=max(return),
+                                        'IQR' = IQR(return))
+stats.ret <-  stats.ret %>% pivot_longer(cols=2:ncol(stats.ret),
+                                         names_to = 'stat') %>% 
+  pivot_wider(names_from = 'horizon')
+stats.ret %>% knitr::kable()
+```
+
+It is in times of great volatility that our algorithm would start buying
+and selling.
+
+```{r echo=FALSE}
+#Remove all within 3 std devs
+filterOutstandingReturns <- function(statsTable, widedf) {
+  #statsTable: Summary table
+  
+  col_names <- colnames(widedf)[grepl('day', colnames(widedf))]
+  new_df <- tibble(Date = widedf[,c('Date')])
+  for (i in seq(1, length(col_names))) {
+    mean = pull(statsTable[statsTable['stat']=='mean', col_names[i]])
+    sd =  pull(statsTable[statsTable['stat']=='sd', col_names[i]])
+    
+    qqq = widedf[widedf[col_names[i]] < (mean  - 3 * sd) | widedf[col_names[i]] > (mean + 3 * sd),
+                  c('Date', col_names[i])] %>% 
+      na.omit()
+    new_df <- new_df %>% left_join(qqq, by = 'Date')
+  }
+  
+  return(new_df)
+}
+
+spy.or <- filterOutstandingReturns(statsTable = stats.ret, widedf = spy.ret)
+# filter(spy.or, !is.na(`1-day`))
+```
+
+```{r echo=FALSE}
+fig.title = "SPY, Abnormal 1-day returns"
+
+spy.1day <- spy.or[c('Date', '1-day')] %>% na.omit()
+
+spy.1day %>% ggplot(aes(x=Date,y=`1-day`)) + geom_point() + 
+  labs(title = fig.title)
+
+spy.1day.garch <- RTL::garch(spy.ret %>% 
+                               select(Date, `1-day`) %>% 
+                               rename('date'= Date) %>% 
+                               na.omit() , 
+                             out='chart')
+garch1 <- RTL::garch(spy.ret %>% 
+                               select(Date, `1-day`) %>% 
+                               rename('date'= Date) %>% 
+                               na.omit() , 
+                      out='data') 
+
+spy.1day.garch
+```
+
+```{r echo=FALSE}
+garchdf <- spy.ret[-1,] %>% cbind(as_tibble(garch1)) %>% 
+  select(-SPY,-returns) %>% 
+  mutate('garch' = log(garch) - lag(log(garch))) %>% 
+  na.omit()
+```
+
+So depending on how high is the volatility, the algorithm will decide
+how much risk to take on each trade execution. With machine learning,
+you can optimize how great the positions should be depending on
+volatility. I want my bot to be more aggressive with the buying and less
+aggressive with selling during volatility spikes.
+
+But one day returns are too unpredictable to make decisions, for that
+its better to take a weighted decision with accumulated returns over a
+certain time horizon.
+
+By filtering returns using longer time horizons, it should yield a
+smaller sample of outstanding returns, by filtering out days where on
+the first you earn 10% and on the second -8%, for example. And it also
+has the ability to identify x-day-long trends and capitalize on them.
+
+```{r echo=FALSE, fig.height=3, fig.width=4}
+
+chartAbnormalReturns <- function(df) {
+  horizon = colnames(df)[2]
+  fig.title = paste("SPY, Abnormal", horizon, "returns", sep = " ")
+  ggplot(df, aes(x=Date,y=.data[[horizon]])) + 
+    geom_point(na.rm = TRUE) + 
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = fig.title)
+}
+  
+spy.or[c('Date', '5-day')] %>% na.omit() %>% chartAbnormalReturns()
+spy.or[c('Date', '21-day')] %>% na.omit() %>% chartAbnormalReturns()
+spy.or[c('Date', '63-day')] %>% na.omit() %>% chartAbnormalReturns()
+spy.or[c('Date', '126-day')] %>% na.omit() %>% chartAbnormalReturns()
+spy.or[c('Date', '252-day')] %>% na.omit() %>% chartAbnormalReturns()
+
+
+```
+
+As we augment the time horizon, the abnormal returns are more scarce and
+it is more apparent that positive returns come out after negatives.
+Therefore the long-time horizon opportunities are the ones in which we
+should more aggressively buy the dip.
+
+The idea now is to, within the range of the long-term abnormal returns,
+buy the daily dips. To capitalize on this we will buy the stock when the
+sign of the returns reverses.
+
+Let put the abnormal returns on the stock chart. To better visualize the
+buying moments:
+
+```{r echo=FALSE}
+fig.title = 'Abnormal returns dates'
+# spy.ret
+  
+
+p1 <- spy.or %>% left_join(spy.ret[c('Date', 'SPY')], by = 'Date') %>% 
+  pivot_longer(cols = 2:ncol(spy.or), names_to = 'horizon', values_to = 'value') %>% 
+  mutate('SPY' = scale(SPY),
+         'SPY' = SPY-mean(SPY))
+
+p1 %>% filter(horizon %in% c('63-day', '126-day', '252-day')) %>% 
+  ggplot(aes(x=Date,y=SPY)) + geom_line() + 
+  geom_point(aes(y=value, col=horizon), na.rm = TRUE) +
+  labs(title = fig.title)
+
+```
+
+##### Is the standard deviation correct?
+
+The standard deviation used already takes into account all these dips.
+So it could be considered taking the standard deviation of the future at
+that time. But history repeats itself and this standard deviation would
+be valid right before the 2008 crash as well as right before the
+coronavirus crash. Moreover, it shows that these buying/selling
+opportunities occur in times of high volatility, with measures such as
+garch and the VIX index, availably known at the time.
+
+Since the bot only activates in abnormal returns, it will not work in
+time where the market steadily grows, therefore when we buy, we buy in
+bigger quantities and when we sell, sell in smaller quantities to that
+way capture as much growth as possible.
+
+Here for example, we buy whenever outstanding returns turn reverse their
+sign.
+
+```{r echo=FALSE}
+# When do the abn returns change sign?
+
+reversalPoints <- function(widedf) {
+
+  for (i in seq(2,length(widedf))) {
+    qqq = na.omit(widedf[i])
+    col_name <- gsub(pattern = '-day',replacement='-rev', x=colnames(qqq)) 
+    qqq[col_name] <- if_else(qqq[1] * lag(qqq[1]) < 0, 1,0)
+    
+    widedf <- left_join(widedf, qqq, by= colnames(qqq)[1])
+  } 
+  return(widedf)
+}
+
+reversal <- 
+  na.omit(p1) %>% pivot_wider(names_from = 'horizon', values_from = 'value') %>% 
+  select(-SPY, -'1-day', -'5-day') %>% reversalPoints()
+
+
+# reversal %>% select(Date, contains(match = '21')) %>% na.omit()
+reversal %>% select(Date, contains(match = '63')) %>% filter(`63-rev` == 1) %>% na.omit() %>% 
+  kable()
+reversal %>% select(Date, contains(match = '126')) %>% filter(`126-rev` == 1) %>%  na.omit() %>% 
+  kable()
+reversal %>% select(Date, contains(match = '252')) %>% filter(`252-rev` == 1) %>%  na.omit() %>% 
+  kable()
+
+# reversal
+
+reversal <- spy.ret %>% left_join(reversal %>% select(Date, contains('rev')),by='Date')
+
+```
+
+The strategy will consist in buying when:
+
+-    Cumulative returns reverse signs meaning buying later after the big
+    drawdown when sign turns negative.
+
+-    And buying when the bull market returns after market crashes.
+
+The selling rules are to sell a smaller quantity when:
+
+-   We have at least a position of 2, because we want to hold the stock
+    as much as possible during a bull market.
+
+-   And when there is abnormal positive returns for a one-year period
+    and a 6-month period.
+
+```{r echo=FALSE}
+
+spy <- df %>% filter(Symbol=='SPY') %>% select(-Symbol) %>%
+  timetk::tk_xts(date_var = 'Date', silent = TRUE) %>% quantmod::adjustOHLC(use.Adjusted = T)
+
+#Add volatility
+spy[1,] <- NA
+spy <- na.omit(spy)
+
+spy$garch <-  garch1$garch  
+#Add different returns
+spy <- merge(spy, reversal %>% select(-SPY) %>% timetk::tk_xts(date_var = 'Date', silent = TRUE)) %>% na.fill(0)
+```
+
+```{r echo=FALSE}
+#Define strategy rules
+
+data = spy
+# Define signal
+strategy <- function(data = spy, buy.prop, sell.prop) {
+  data$signal <- case_when((data$X126.rev == 1 | data$X252.rev == 1 | data$X63.rev == 1) ~ 1,
+                            TRUE ~ 0)
+
+#Trade positions
+  data$trade.buy <- ifelse(diff(data$signal)==1, buy.prop,0)
+  data$trade.buy <- na.fill(data$trade, fill = 0)
+
+  data$pos <- cumsum(data$trade)
+
+#Sell positions
+  data$sell.signal <- ifelse((data$X252.day > 0 & data$X126.day > 0) & data$pos > 2, 1, 0)
+  data$trade.sell <- ifelse(diff(data$sell.signal)==1, sell.prop,0) %>% na.fill(0)
+  data$pos <- data$pos + cumsum(data$trade.sell)
+  
+#Calculate strategy returns
+#We buy the close so we earn returns a day after the trade.
+#We earn the close to open return once
+  data$pos <- stats::lag(data$pos, k=1)
+  data$retClOp <- quantmod::Delt(quantmod::Cl(data),
+                                  quantmod::Op(data),
+                                  k = 1,
+                                  type = 'arithmetic'
+  )
+
+  data$new_trade <- diff(data$pos)
+
+#If we sell, dont earn anything overnight
+  data$ret_new <- data$new_trade * data$retClOp  
+  data$ret_exist <- data$pos * data$X1.day
+
+#total return
+  data$ret <- data$ret_new + data$ret_exist
+  data <- data %>% na.omit()
+
+  data$cumeq <- cumprod(1 + data$ret) - 1
+
+  
+  return(data)
+}
+
+period.model <- c(from = "1990-01-01", to = "2017-12-31")
+
+# Select Training Subperiod for Model Development
+spy.train <- spy[zoo::index(spy) <= period.model["to"], ]
+# Select Test Subperiod for Walk Forward
+spy.test <- spy[zoo::index(spy) > period.model["to"], ]
+spy.strategy <- strategy(data = spy, buy.prop = 1, sell.prop = c(-0.10))
+```
+
+# Optimization
+
+Now what are the buying and selling proportions, or in other words: how aggressive to be, at which the Cumulative Returns is maximized?
+By testing with different values,
+
+```{r echo=FALSE, include=FALSE}
+out <- expand.grid(
+  buy.prop = seq(from = 1, to = 5, by = 0.5),
+  sell.prop = seq(from = -1, to = -0.05, by = 0.05)
+)
+
+library(foreach)
+library(doParallel)
+# Detect the number of cores
+n_cores <- detectCores() - 1
+# Assign cores and open the cluster
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+res <- foreach(
+  i = 1:nrow(out),
+  .combine = "cbind",
+  .packages = c("tidyverse", "RTL", "quantmod", "PerformanceAnalytics")
+) %dopar% {
+  as.numeric(tradeStats(strategy(data = spy.train, out[i, "buy.prop"], out[i, "sell.prop"])$ret))
+}
+# Stop the cluster
+stopCluster(cl)
+# Create tibble of results
+res <- tibble::as_tibble(t(res))
+stats.names <-
+  names(tradeStats(strategy(data = spy.train, out[1, "buy.prop"], out[1, "sell.prop"])$ret))
+colnames(res) <- stats.names
+out <- cbind(out, res)
+```
+
+
+#### 3D charts of parameters vs Cumulative Returns
+
+The white parts are where Cumulative returns = -1. That is, we lose all.
+```{r echo=FALSE, fig.width = 9}
+out1 <- out %>% filter(CumReturn > -0.95)
+library(lattice)
+BuyingProportion <- out1$buy.prop
+SellingProportion <- out1$sell.prop
+CumulativeReturns <- out1$CumReturn
+
+wireframe(
+  CumulativeReturns ~ BuyingProportion * SellingProportion,
+  scales = list(arrows = FALSE),
+  shade = TRUE,
+  drape = TRUE,
+  colorkey = list(space = "right"),
+  main = "Cumulative Return"
+)
+```
+
+
+```{r echo=FALSE, fig.width = 9}
+library(plotly)
+par2 = unique(out$buy.prop)
+par1 = unique(out$sell.prop)
+CumReturn <-
+  out1 %>% dplyr::select(buy.prop, sell.prop, CumReturn) %>%
+  tidyr::pivot_wider(values_from = CumReturn, names_from = buy.prop) %>%
+  dplyr::select(-1) %>% as.matrix()
+plot_ly(x = ~ par2,
+        y = ~ par1,
+        z = ~ CumReturn) %>% add_surface()
+
+out %>% dplyr::select(buy.prop, sell.prop, CumReturn) %>%
+  ggplot(aes(x = buy.prop, y = sell.prop)) +
+  geom_raster(aes(fill = CumReturn), interpolate = TRUE) +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue") +
+  theme(
+    panel.grid.major.x = element_line(colour = "grey"),
+    panel.grid.minor.x = element_line(colour = "grey"),
+    panel.grid.major.y = element_line(colour = "grey"),
+    panel.grid.minor.y = element_line(colour = "grey"),
+    panel.background = element_rect(fill = "white")
+  ) +
+  labs(title = "Optimization Results Grid",
+       subtitle = "")
+```
+
+Seems like there is a linear relationship between buying and selling
+proportions...
+
+
+#### Z-score for metrics
+```{r echo=FALSE}
+outZ <- out %>% filter(CumReturn > -0.95) %>% 
+  tidyr::pivot_longer(
+    cols = -c(buy.prop, sell.prop),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  dplyr::group_by(variable) %>%
+  dplyr::mutate(valueZ = (value - mean(value)) / sd(value))
+
+outZ %>%
+  ggplot(aes(x = valueZ)) +
+  geom_histogram(color = "black", 
+                 fill = "blue", 
+                 aes(y = ..density..),
+                 bins = 30,
+                 na.rm = TRUE) +
+  facet_wrap( ~ variable, scales = "free_y") %>% suppressWarnings()
+```
+
+```{r echo=FALSE}
+outZ %>%
+  ggplot(aes(x = buy.prop, y = sell.prop)) +
+  geom_raster(aes(fill = valueZ), interpolate = TRUE) +
+  facet_wrap( ~ variable, scales = "free") +
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "blue",
+    midpoint = 0
+  ) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.background = element_rect(fill = "white")
+  ) +
+  labs(title = "Optimization Results Grid",
+       subtitle = "Z-score for Comparability")
+```
+
+The combinations of buying and selling proportions with positive returns are shown below:
+
+```{r echo=FALSE}
+out %>% dplyr::filter(CumReturn > 0, Omega > 2) %>%
+  dplyr::arrange(desc(DD.Max)) %>% top_n(10) %>% kable()
+```
+
+## **Walk Forward period** 
+
+To test the strategy, I used the proportions that respect my risk profile,
+
+-   Positive returns
+
+-   Omega greater than 2
+
+-   The lowest risk (annual standard deviation)
+
+That is, a buying proportion of 1.5 and selling of -0.15.
+
+```{r echo=FALSE}
+parameters = c(buy.prop = 1.5,sell.prop = -0.15)
+
+strat.test <- strategy(data=spy.test, parameters[['buy.prop']], parameters[['sell.prop']])
+```
+
+#### Results:
+
+```{r echo=FALSE, fig.keep='last', fig.height=8, fig.width=10}
+plot(strat.test$Close, main = "Strategy Results")
+addSeries(
+  strat.test$new_trade,
+  main = "Trades",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  strat.test$pos,
+  main = "Positions",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  strat.test$cumeq,
+  main = "CumEQ",
+  on = NA,
+  type = "l",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+```
+
+```{r echo=FALSE}
+RTL::tradeStats(strat.test$ret) %>% as_tibble() %>% pivot_longer(cols = everything(), names_to = "Statistic", values_to = "Value") %>% kable()
+```
+
+## Takeaways
+
+The strategy is certainly very passive. It is a strategy more suitable
+for low risk profiles and for long term holders. It is a strategy that
+maximizes gains by deciding to buy after a big dip and to gradually sell
+to make profits. Because of this long-term hold factor, it is rather
+safe.
+
+Needless to say that it also requires these abnormal return periods in
+which it activates. The benefits of that are that there is less comission fees, as well as less capital gains tax after selling the positions.
+
+Perhaps it will also work with more volatile stocks
+that earn positive returns in the long run.
+
+## Learning
+ 
+In this project I learnt that a good strategy isn't necessarily the most
+aggressive one. Sometimes buying a few times rather than many yields the
+best results. Also that it is important to analyze the results of a
+strategy carefully to check its validity. The training period and the
+testing period are very important too, otherwise it would be cheating to
+test your strategy on the same period where you derive the tuned
+parameters. Overall it has been a great experience to do this
+Quantitative Trading Project. The experience in itself is worth a lot,
+from the small tweaking to the bigger picture planning.
+
+I will definitely pursue more complex quant strategies that include machine
+learning techniques and a more deep analysis of the underlying asset.
