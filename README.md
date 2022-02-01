@@ -1,5 +1,6 @@
 # first-algo-trading
 This is my first algorithmic trading strategy that I built for the purpose of my quantitative finance class at the University of Alberta.
+
 **Click on the pdf file in the repo to view the project!**
 
 
